@@ -1,73 +1,97 @@
 import streamlit as st
-import os
-import fitz  # PyMuPDF
-import google.generativeai as genai
+from utils.pdf_utils import extract_structured_text_from_pdf, blocks_to_plain_resume_text, insert_bullets_into_pdf
+from utils.render_utils import render_markdown_like_to_pdf
+from utils.prompts import generate_version_prompts
+from utils.gemini_utils import call_gemini
+from utils.parse_utils import parse_added_bullets_from_generated, remove_or_replace_added_bullets
+import io
 
-# -----------------------------
-# Setup Gemini API
-# -----------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
-genai.configure(api_key=GEMINI_API_KEY)
+st.set_page_config(page_title="Resume AI", layout="wide")
+st.title("AI Resume Generator with JD Matching & ATS Versions")
 
-# Load Gemini model
-model = genai.GenerativeModel("gemini-1.5-flash")
+uploaded_resume = st.file_uploader("Upload Resume (PDF)", type=["pdf"])
+jd_text = st.text_area("Paste Job Description", height=220)
 
-# -----------------------------
-# Helper: Extract text from PDF
-# -----------------------------
-def extract_text_from_pdf(uploaded_file):
-    text = ""
-    try:
-        with fitz.open(stream=uploaded_file.read(), filetype="pdf") as doc:
-            for page in doc:
-                text += page.get_text("text") + "\n"
-    except Exception as e:
-        st.error(f"❌ Error extracting text from PDF: {e}")
-    return text.strip()
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(page_title="Resume JD Matcher", layout="centered")
-
-st.title("📄 AI Resume – JD Matcher")
-st.write("Upload your resume PDF and paste the Job Description. Get **crystal-clear improvements** to match the role.")
-
-# Upload PDF Resume
-uploaded_resume = st.file_uploader("📎 Upload Resume (PDF)", type=["pdf"])
-
-resume_text = ""
+# Wrap uploaded_resume in BytesIO for re-use
 if uploaded_resume is not None:
-    resume_text = extract_text_from_pdf(uploaded_resume)
+    uploaded_pdf_bytes = uploaded_resume.read()
+    uploaded_pdf_io = io.BytesIO(uploaded_pdf_bytes)
+else:
+    uploaded_pdf_io = None
 
-# Job description text area
-jd = st.text_area("📝 Paste the Job Description (JD):", height=200, placeholder="Copy-paste the job description here...")
-
-if st.button("🔍 Analyze Resume vs JD"):
-    if not resume_text or not jd.strip():
-        st.warning("⚠️ Please provide both a valid resume PDF and JD.")
+if st.button("Generate Versions"):
+    if not uploaded_pdf_io or not jd_text.strip():
+        st.warning("Upload resume and paste JD first.")
     else:
-        with st.spinner("Analyzing resume..."):
-            prompt = f"""
-You are an expert resume coach. Compare the following **Resume** and **Job Description (JD)**.
-Return **only a crystal-clear improvement checklist** with points that the candidate must add or improve in the resume 
-to qualify for the job. 
+        blocks_struct = extract_structured_text_from_pdf(io.BytesIO(uploaded_pdf_bytes))
+        resume_text = blocks_to_plain_resume_text(blocks_struct)
+        prompts = generate_version_prompts(resume_text, jd_text)
 
-Strict rules:
-- Use **bold** for key skills/points.
-- No vague suggestions like "maybe add" or "could improve".
-- No multiple-choice answers, just **direct actionable points**.
-- Keep it short, precise, and professional.
+        st.session_state.generated = {}
+        st.session_state.added_info = {}
+        for key, prompt in prompts.items():
+            out = call_gemini(prompt)
+            st.session_state.generated[key] = out
+            st.session_state.added_info[key] = parse_added_bullets_from_generated(out)
+        st.success("Generated all versions.")
 
-Resume:
-{resume_text}
+if "generated" in st.session_state:
+    for key, text in st.session_state.generated.items():
+        st.subheader(f"Version {key}")
+        st.text_area(f"Preview {key}", value=text, height=200, key=f"gen_{key}")
+        added_list = st.session_state.added_info[key]
 
-Job Description:
-{jd}
-"""
-
-            response = model.generate_content(prompt)
-            result = response.text.strip()
-
-        st.subheader("✅ Improvement Checklist")
-        st.markdown(result)
+        if added_list:
+            edits_map = {}
+            for item in added_list:
+                with st.expander(item["bullet_text"], expanded=False):
+                    keep = st.checkbox("Keep bullet?", True, key=f"{key}_{item['id']}_keep")
+                    edit = st.text_area("Edit text:", item["bullet_text"], key=f"{key}_{item['id']}_edit")
+                    edits_map[item["id"]] = {"keep": keep, "text": edit}
+            if st.button(f"Finalize {key}"):
+                final_text = remove_or_replace_added_bullets(text, edits_map)
+                if key == "B":
+                    added_bullets_by_section = {}
+                    for item in added_list:
+                        if edits_map.get(item["id"], {"keep": True})["keep"]:
+                            bullet = edits_map[item["id"]]["text"] or item["bullet_text"]
+                            bullet_lower = bullet.lower()
+                            if any(word in bullet_lower for word in ["skill", "proficient", "expertise"]):
+                                section = "Skills"
+                            elif any(word in bullet_lower for word in ["project", "developed", "built"]):
+                                section = "Projects"
+                            elif any(word in bullet_lower for word in ["experience", "worked", "responsible", "managed", "engineer", "analyst", "developer"]):
+                                section = "Experience"
+                            else:
+                                section = "Other"
+                            added_bullets_by_section.setdefault(section, []).append(bullet)
+                    st.write("[DEBUG] Bullets to insert:", added_bullets_by_section)
+                    if not added_bullets_by_section:
+                        st.info("No new bullets to insert into the PDF for Version B.")
+                        pdf_buf = io.BytesIO(uploaded_pdf_bytes)
+                    else:
+                        # Also show section_locs from the PDF for debugging
+                        import fitz
+                        uploaded_pdf_io_debug = io.BytesIO(uploaded_pdf_bytes)
+                        doc_debug = fitz.open(stream=uploaded_pdf_io_debug.read(), filetype="pdf")
+                        section_locs_debug = {}
+                        for page_num, page in enumerate(doc_debug):
+                            blocks = page.get_text("blocks")
+                            for b in blocks:
+                                text = b[4].strip()
+                                if not text:
+                                    continue
+                                if text.isupper() or text.lower() in [s.lower() for s in added_bullets_by_section.keys()]:
+                                    section_locs_debug[text.lower()] = (page_num, b)
+                        st.write("[DEBUG] Section locations found:", section_locs_debug)
+                        pdf_buf = insert_bullets_into_pdf(io.BytesIO(uploaded_pdf_bytes), added_bullets_by_section)
+                else:
+                    pdf_buf = render_markdown_like_to_pdf(final_text)
+                st.download_button(
+                    f"⬇️ Download Version {key}",
+                    pdf_buf,
+                    file_name=f"resume_{key}.pdf",
+                    mime="application/pdf"
+                )
+        else:
+            st.info("No JD-derived bullets found.")

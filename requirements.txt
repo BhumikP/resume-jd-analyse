@@ -1,6 +1,18 @@
-streamlit
-sentence-transformers
-PyMuPDF
-openai
-nltk
-google-generativeai
+Flask==3.0.3
+Flask-Cors==4.0.0
+Werkzeug==3.0.3
+
+# PDF and Resume handling
+PyMuPDF==1.24.9
+reportlab==4.2.2
+
+# Image & OCR
+pytesseract==0.3.13
+Pillow==10.4.0
+
+# Data handling
+numpy==1.26.4
+pandas==2.0.3
+
+# Utils
+requests==2.32.3

@@ -1,6 +1,4 @@
-#!/bin/sh
-'''exec' "/Users/bhumikprajapati/Documents/Aws /my_project_env/bin/python3.13" "$0" "$@"
-' '''
+#!/Users/bhumikprajapati/Documents/Aws/my_project_env/bin/python3.12
 # -*- coding: utf-8 -*-
 import re
 import sys
